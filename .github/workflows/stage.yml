@@ -1,0 +1,122 @@
+name: issuer-spike-stage
+# AR-B section 7 item 1 spike. One deterministic stage (pytest + JUnit XML + coverage JSON)
+# from stage/stage-spec-draft.yaml, on a pinned public fixture. No secrets are used or mounted.
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: JSON list of runner labels
+        default: '["blacksmith-4vcpu-ubuntu-2404","ubuntu-24.04"]'
+
+permissions:
+  contents: read
+  id-token: write # only to read the workload identity claims; the token itself is not stored
+
+env:
+  FIXTURE_URL: https://github.com/pallets/itsdangerous
+  FIXTURE_COMMIT: 672971d66a2ef9f85151e53283113f33d642dabd
+  FIXTURE_TREE: ef4287f82d8234404b58c7b29d38197e1f38e207
+  IMAGE_INDEX: docker.io/library/python@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+  IMAGE_AMD64: sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0
+  UV_VERSION: 0.11.29
+  UV_SHA256: 04f8b82f5d47f0512dcd32c67a4a6f16a0ea27c81537c338fd0ad6b23cebe829
+  NATIVE_PY: 3.12.11
+
+jobs:
+  stage:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+        mode: [container, native]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: spike
+
+      - name: Fetch fixture at pinned commit and verify tree
+        run: |
+          git init -q fixture && cd fixture
+          git fetch -q --depth 1 "$FIXTURE_URL" "$FIXTURE_COMMIT"
+          git -c advice.detachedHead=false checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$FIXTURE_COMMIT"
+          test "$(git rev-parse HEAD^{tree})" = "$FIXTURE_TREE"
+          rm -rf .git
+
+      - name: Prepare dirs
+        run: |
+          RUN_ID="ci-${{ matrix.mode }}-${{ matrix.runner }}"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out/$RUN_ID" "$RUNNER_TEMP/deps"
+          chmod 777 "$RUNNER_TEMP/out/$RUN_ID" "$RUNNER_TEMP/deps"
+
+      - name: Run stage in container (pinned image digest, linux/amd64)
+        if: matrix.mode == 'container'
+        run: |
+          OUT="$RUNNER_TEMP/out/$RUN_ID"
+          docker pull -q --platform linux/amd64 "$IMAGE_INDEX"
+          docker image inspect "$IMAGE_INDEX" --format '{{json .}}' > "$OUT/image-inspect.json"
+          COMMON="--rm --platform linux/amd64 --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges
+            --read-only --tmpfs /tmp:rw,size=256m --memory 2g --cpus 2 --pids-limit 512
+            -v $GITHUB_WORKSPACE/spike/stage:/spec:ro -v $RUNNER_TEMP/deps:/deps"
+          t0=$(date +%s.%N)
+          docker run $COMMON "$IMAGE_INDEX" sh /spec/run_stage.sh install python /src /deps /out /spec
+          t1=$(date +%s.%N)
+          docker run $COMMON --network none -v "$GITHUB_WORKSPACE/fixture:/src:ro" -v "$OUT:/out" \
+            "$IMAGE_INDEX" sh /spec/run_stage.sh test python /src /deps /out /spec
+          t2=$(date +%s.%N)
+          python3 -c "import json,sys;a,b,c=map(float,sys.argv[1:]);print(json.dumps({'install_s':round(b-a,3),'test_s':round(c-b,3)}))" $t0 $t1 $t2 > "$OUT/wall.json"
+          docker run --rm --platform linux/amd64 "$IMAGE_INDEX" sh -c 'python -VV; python -m pip --version; uname -a' > "$OUT/container-identity.txt"
+
+      - name: Run stage natively on the runner (uv ${{ env.UV_VERSION }}, CPython ${{ env.NATIVE_PY }})
+        if: matrix.mode == 'native'
+        run: |
+          OUT="$RUNNER_TEMP/out/$RUN_ID"
+          curl -sSfL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$UV_SHA256  /tmp/uv.tgz" | sha256sum -c -
+          tar -xzf /tmp/uv.tgz -C /tmp
+          /tmp/uv-x86_64-unknown-linux-gnu/uv python install -q "$NATIVE_PY"
+          PY=$(/tmp/uv-x86_64-unknown-linux-gnu/uv python find "$NATIVE_PY")
+          t0=$(date +%s.%N)
+          sh spike/stage/run_stage.sh install "$PY" "$GITHUB_WORKSPACE/fixture" "$RUNNER_TEMP/deps" "$OUT" "$GITHUB_WORKSPACE/spike/stage"
+          t1=$(date +%s.%N)
+          sh spike/stage/run_stage.sh test "$PY" "$GITHUB_WORKSPACE/fixture" "$RUNNER_TEMP/deps" "$OUT" "$GITHUB_WORKSPACE/spike/stage"
+          t2=$(date +%s.%N)
+          python3 -c "import json,sys;a,b,c=map(float,sys.argv[1:]);print(json.dumps({'install_s':round(b-a,3),'test_s':round(c-b,3)}))" $t0 $t1 $t2 > "$OUT/wall.json"
+          { "$PY" -VV; "$PY" -m pip --version; uname -a; } > "$OUT/native-identity.txt"
+
+      - name: Record runner identity and workload identity claims
+        run: |
+          OUT="$RUNNER_TEMP/out/$RUN_ID"
+          python3 - "$OUT" <<'PY'
+          import base64, json, os, platform, subprocess, sys, urllib.request
+          out = sys.argv[1]
+          keys = ["GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_WORKFLOW", "GITHUB_WORKFLOW_REF",
+                  "GITHUB_WORKFLOW_SHA", "GITHUB_REF", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+                  "GITHUB_EVENT_NAME", "RUNNER_NAME", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_ENVIRONMENT",
+                  "ImageOS", "ImageVersion"]
+          ident = {k: os.environ.get(k) for k in keys}
+          ident["uname"] = " ".join(platform.uname())
+          ident["os_release"] = open("/etc/os-release").read()
+          ident["nproc"] = os.cpu_count()
+          ident["cpu_model"] = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), None)
+          ident["docker_version"] = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"], capture_output=True, text=True).stdout.strip()
+          json.dump(ident, open(f"{out}/runner-identity.json", "w"), indent=2, sort_keys=True)
+          req = urllib.request.Request(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=issuer-spike-20261023",
+                                       headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          tok = json.load(urllib.request.urlopen(req))["value"]
+          payload = tok.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          json.dump(claims, open(f"{out}/oidc-claims.json", "w"), indent=2, sort_keys=True)  # claims only, no token
+          PY
+          cat "$OUT/digests.json" "$OUT/wall.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.RUN_ID }}
+          path: ${{ runner.temp }}/out/${{ env.RUN_ID }}
+          include-hidden-files: false
+          retention-days: 14

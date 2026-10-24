@@ -1,0 +1,70 @@
+# DRAFT machine-readable stage spec (AR-B section 7 item 1 spike, 2026-10-23).
+# Not the qg: published spec. Field names are a proposal for U13 (ledger F11 shape).
+spec_version: issuer-stage-spec/v0-draft
+spec_written_at: "2026-10-24T01:55:35Z"   # written before the first stage run
+stage:
+  id: tests-junit-coverage
+  kind: deterministic           # KTD4: enforceable class
+  description: pytest with JUnit XML and coverage JSON over the subject tree
+subject:                        # the measured input; subject-controlled content (KTD4)
+  repo_url: https://github.com/pallets/itsdangerous
+  commit: 672971d66a2ef9f85151e53283113f33d642dabd
+  git_tree: ef4287f82d8234404b58c7b29d38197e1f38e207
+  license: BSD-3-Clause
+  subject_controlled_config_honoured: ['pyproject.toml [tool.pytest.ini_options]']
+  subject_controlled_config_ignored: ['pyproject.toml [tool.coverage.*]', pip.conf, 'PIP_* env']
+execution_environment:          # identity a second runner must carry to claim byte equality
+  container_image:
+    ref: docker.io/library/python:3.12-slim-bookworm
+    index_digest: sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+    platform_digests:
+      linux/amd64: sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0
+      linux/arm64/v8: sha256:c3729439afc4ec3f3e159e0c86aeabfadac8030ef46838a0256383d0511c5f5e
+    required_platform: linux/amd64   # identity = index digest + platform digest
+  python: "3.12.15"                  # from the image (PYTHON_VERSION)
+  lockfile:
+    path: requirements.lock          # uv pip compile --generate-hashes --universal --exclude-newer 2026-10-09
+    sha256: 78d7f9b70497a7380a3899d4e92b7d64524308c474f7a07434f0b34590f84ef0
+    tools: {pytest: "9.1.1", pytest-cov: "7.1.0", coverage: "7.16.2", freezegun: "1.5.5"}
+  env_allowlist:                     # the test phase starts from env -i with exactly these
+    PATH: /usr/local/bin:/usr/bin:/bin
+    HOME: /tmp
+    TZ: UTC
+    LC_ALL: C.UTF-8
+    PYTHONPATH: "<DEPS>:<SRC>/src"
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONHASHSEED: "0"
+    PYTHONNOUSERSITE: "1"
+    COVERAGE_FILE: "<OUT>/raw/.coverage"
+    COVERAGE_CORE: ctrace
+  container_flags: [--user 65534:65534, --cap-drop ALL, --security-opt no-new-privileges, --read-only,
+                    "--tmpfs /tmp:rw,size=256m", --memory 2g, --cpus 2, --pids-limit 512]
+  network: {install: 'allowed (PyPI, hash-locked wheels only)', test: none}
+  secrets_mounted: none
+inputs:
+  - {name: subject, mount: /src, mode: ro, digest: "gitTree:ef4287f82d8234404b58c7b29d38197e1f38e207"}
+  - {name: stage_files, mount: /spec, mode: ro, files: {
+      run_stage.sh: "sha256:d39ca314861df517a230119f4c3719f0be271e54f0f8a396db8425b9905d6378",
+      normalize.py: "sha256:c2b202a710a4fd106c61f736eaf233809bb0414dd6e58ce9462fcb6b1fdb5ee2",
+      coveragerc: "sha256:a8bfbf7de113c9b9bd05320adc5771e92dd4afdab1a763f34cdcd26dc031dfba",
+      requirements.lock: "sha256:78d7f9b70497a7380a3899d4e92b7d64524308c474f7a07434f0b34590f84ef0"}}
+commands:                            # argv run inside the environment, in order
+  - phase: install
+    argv: [sh, /spec/run_stage.sh, install, python, /src, /deps, /out, /spec]
+  - phase: test
+    argv: [sh, /spec/run_stage.sh, test, python, /src, /deps, /out, /spec]
+    effective: >-
+      python -m pytest -p no:cacheprovider --rootdir=/src -o junit_family=xunit2 -o junit_logging=no
+      -o junit_duration_report=total --junitxml=/out/raw/junit.xml --cov --cov-config=/spec/coveragerc
+      --cov-report=json:/out/raw/coverage.json --cov-report= -q tests
+limits: {wall_clock_s: 1200, memory: 2g, cpus: 2, pids: 512}
+outputs:
+  raw:  [raw/junit.xml, raw/coverage.json, raw/pytest-stdout.txt, raw/exit-code]
+  normalized: [norm/junit.xml, norm/coverage.json, norm/summary.json]
+  digests: digests.json             # sha256 of raw and normalized files
+normalization:
+  definition: NORMALIZATION.md
+  definition_sha256: d5d9758f21f33922a543015c3d5c7e5dc91293f5e73499000aa8e7a9fe9b7775
+  implementation: normalize.py
+  verdict_on: [norm/junit.xml, norm/coverage.json]
+out_of_scope_for_spike: [signing, envelope emit, base-ref integrity check, egress proxy, process-group kill, cost cap]

@@ -1,0 +1,10 @@
+# Spec-owned coverage config (the fixture's pyproject names jinja2 as source; not used).
+[run]
+branch = True
+relative_files = True
+source = itsdangerous
+
+[report]
+exclude_also =
+    if t.TYPE_CHECKING
+    raise NotImplementedError
